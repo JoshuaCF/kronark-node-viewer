@@ -1,0 +1,5 @@
+reorder_imports=true
+# Use tabs for indentation (note: rustfmt uses `hard_tabs` instead of `indent_style`)
+hard_tabs = true
+# Specify line endings (rustfmt defaults to `lf` but this reinforces it)
+newline_style = "Unix"
