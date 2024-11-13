@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::style::Style;
 use ratatui::widgets::Widget;
+use ratatui::DefaultTerminal;
 
 use kronark_node_parser::kronarknode::{
-	Node,
-	instance::Instance,
-	nodes::NodeEntry,
-	roots::Roots,
-	types::TypeEntry,
+	instance::Instance, nodes::NodeEntry, roots::Roots, socket::DataType, types::TypeEntry, Node,
 };
 
 // Take ownership of a `Node` and parse out its contents
@@ -76,20 +77,75 @@ use kronark_node_parser::kronarknode::{
 // certainly not final. If someone begins to implement this or components of this, do let me know
 // so we can coordinate our work and discuss the structure of this.
 
+// Buffer intermediary that will ignore draws entirely offscreen and handle discarding of draws
+// partially offscreen
+struct OverdrawBuffer {}
+
+struct Size {
+	width: i32,
+	height: i32,
+}
+trait WidgetSize {
+	fn get_size_estimate(&self) -> Size;
+}
+// Uses `OverdrawBuffer` instead of `Buffer` and takes a shift value
+// Should auto-implement on `Widget`s
+trait OverdrawWidget {
+	fn render(&self, area: Rect, x_shift: i32, y_shift: i32, buf: &mut OverdrawBuffer);
+}
+
 // Thin wrapper for type-safety
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct InstanceID(usize);
 impl Deref for InstanceID {
 	type Target = usize;
-	fn deref(&self) -> &Self::Target { &self.0 }
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
 }
 
 // TODO: We need a way to store the padding. Should it be here or elsewhere?
+#[derive(Debug, Default)]
 struct Column {
 	instances: Vec<InstanceID>,
-	width: i32, // Max width of any instance in the column, signed to play nicely with shifts
 }
 
+#[derive(Debug)]
+struct InstanceRenderer {
+	id: InstanceID,
+	x_pos: i32,
+	y_pos: i32,
+	width: i32,
+	height: i32,
+}
+impl InstanceRenderer {
+	fn from_instance(instance: &Instance, x_pos: i32, y_pos: i32) -> InstanceRenderer {
+		// TODO: Replace dummy values with correctly computed values
+		InstanceRenderer {
+			id: InstanceID(instance.key),
+			x_pos,
+			y_pos,
+			width: 20, // TEMP
+			height: 5, // TEMP
+		}
+	}
+}
+impl WidgetSize for InstanceRenderer {
+	fn get_size_estimate(&self) -> Size {
+		Size {
+			width: self.width,
+			height: self.height,
+		}
+	}
+}
+impl Widget for &InstanceRenderer {
+	fn render(self, area: Rect, buf: &mut Buffer) {
+		// TODO: Make this render the node properly
+		buf.set_style(area, Style::new().bg(Color::Rgb(30, 30, 30)));
+	}
+}
+
+#[derive(Debug)]
 struct NodeDefRenderer {
 	roots: Roots,
 	// We aren't guaranteed to have consecutive instance IDs, so a `HashMap` it is
@@ -102,6 +158,51 @@ struct NodeDefRenderer {
 	y_shift: i32,
 }
 impl NodeDefRenderer {
+	fn init_layout(&mut self) {
+		// Notate a depth for each instance, keeping track of the largest depth
+		// NOTE: In this situation, depth is labelled from right to left with right being depth 0.
+		// This is done because it is easier. Instances are only aware of their connections from
+		// their inputs, so it is easiest to travel backwards through the graph
+
+		let mut depths: HashMap<InstanceID, usize> = HashMap::new();
+		let mut to_process = vec![];
+		for (instance_id, _) in self.roots.output_connections.iter() {
+			if *instance_id == 255 {
+				continue;
+			}
+			depths.insert(InstanceID(*instance_id as usize), 0);
+			to_process.push(InstanceID(*instance_id as usize));
+		}
+
+		let mut max_depth = 0;
+		while to_process.len() > 0 {
+			// `.unwrap()` acceptable since if there's no value, something has gone *very wrong*
+			let instance_id = to_process.pop().unwrap();
+			let instance_depth = *depths.get(&instance_id).unwrap();
+			max_depth = max_depth.max(instance_depth);
+			let instance = self.instance_table.get(&instance_id).unwrap();
+			for socket in instance.sockets.iter() {
+				if let Some(DataType::Connection(connection_id, _)) = socket.data {
+					if connection_id == 255 {
+						continue;
+					}
+					depths.insert(InstanceID(connection_id as usize), instance_depth + 1);
+					to_process.push(InstanceID(connection_id as usize));
+				}
+			}
+		}
+
+		// Reorganize into columns
+		let mut columns = vec![];
+		columns.resize_with(max_depth + 1, Column::default);
+
+		for (instance_id, depth) in depths {
+			columns[depth].instances.push(instance_id);
+		}
+
+		self.instance_layout = columns;
+	}
+
 	fn from_node(node: Node) -> Self {
 		match node {
 			Node::V1(node_def) => {
@@ -114,19 +215,19 @@ impl NodeDefRenderer {
 					instance_table.insert(InstanceID(instance.key), instance);
 				}
 
-				// TODO: Here we would parse the data and generate the columns
-				let mut instance_layout = vec!();
-
-				NodeDefRenderer {
+				let mut renderer = NodeDefRenderer {
 					roots,
 					instance_table,
 					node_table,
 					type_table,
-					instance_layout,
+					instance_layout: vec![],
 					x_shift: 0,
 					y_shift: 0,
-				}
-			},
+				};
+				renderer.init_layout();
+
+				renderer
+			}
 			#[allow(unreachable_patterns)]
 			_ => panic!("unsupported version"),
 		}
@@ -134,16 +235,71 @@ impl NodeDefRenderer {
 }
 impl Widget for &NodeDefRenderer {
 	fn render(self, area: Rect, buffer: &mut Buffer) {
-		todo!()
+		// Render input root, then columns from last to first, then output root
+		let mut cur_x = 0;
+		let mut cur_y = 0;
+
+		// temp paddings
+		let pad_x = 3;
+		let pad_y = 1;
+
+		// TODO: Render a proper input root
+		buffer.set_style(
+			Rect::new(cur_x as u16, cur_y as u16, 20, 5),
+			Style::new().bg(Color::Rgb(100, 100, 100)),
+		);
+
+		cur_x += 20 + pad_x;
+
+		for column in self.instance_layout.iter().rev() {
+			cur_y = 0;
+			let mut max_width = 0;
+
+			for instance_id in column.instances.iter() {
+				let cur_instance = self.instance_table.get(instance_id).unwrap();
+				let renderer = InstanceRenderer::from_instance(cur_instance, cur_x, cur_y);
+				let cur_width = renderer.width;
+				let cur_height = renderer.height;
+				let draw_area = Rect::new(
+					cur_x as u16,
+					cur_y as u16,
+					cur_width as u16,
+					cur_height as u16,
+				);
+				renderer.render(draw_area, buffer);
+
+				cur_y += cur_height + pad_y;
+				max_width = max_width.max(cur_width);
+			}
+
+			cur_x += max_width + pad_x;
+		}
 	}
 }
 
-fn run(renderer: NodeDefRenderer) {
-	todo!();
+fn run(mut terminal: DefaultTerminal, mut renderer: NodeDefRenderer) -> std::io::Result<()> {
+	loop {
+		terminal.draw(|frame| frame.render_widget(&renderer, frame.area()))?;
+		if let Event::Key(ke) = event::read()? {
+			if ke.kind != KeyEventKind::Press {
+				continue;
+			}
+			match ke.code {
+				KeyCode::Char('q') => break,
+				_ => (),
+			}
+		}
+	}
+
+	Ok(())
 }
 
 // This will setup the terminal and the renderer struct, then enter another function to loop
 // drawing and event processing
 pub fn enter_node_view(node: Node) -> std::io::Result<()> {
-	todo!()
+	let renderer = NodeDefRenderer::from_node(node);
+	let terminal = ratatui::init();
+	let result = run(terminal, renderer);
+	ratatui::restore();
+	result
 }
